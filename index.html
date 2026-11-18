@@ -10,6 +10,296 @@
   <title>FilmaGol — Gravação Contínua de Lances</title>
   <script src="tailwind.js"></script>
   <script src="jszip.min.js"></script>
+  <script>
+/* ===== Correção de duração dos clipes (MediaRecorder) ===== */
+const FixMedia = (function () {
+  const td = new TextDecoder('latin1');
+  const u32 = (d, o) => d.getUint32(o);
+  const type4 = (u8, o) => String.fromCharCode(u8[o], u8[o + 1], u8[o + 2], u8[o + 3]);
+
+  function boxes(u8, start, end) {
+    const out = [];
+    let p = start;
+    while (p + 8 <= end) {
+      const dv = new DataView(u8.buffer, u8.byteOffset + p, 16 <= end - p ? 16 : end - p);
+      let size = dv.getUint32(0), hdr = 8;
+      const type = type4(u8, p + 4);
+      if (size === 1) { size = Number(dv.getBigUint64(8)); hdr = 16; }
+      else if (size === 0) size = end - p;
+      if (size < hdr || p + size > end) break;
+      out.push({ type, start: p, hdr, size, end: p + size, body: p + hdr });
+      p += size;
+    }
+    return out;
+  }
+  const find = (u8, b, t) => boxes(u8, b.body, b.end).find(x => x.type === t);
+  const findAll = (u8, b, t) => boxes(u8, b.body, b.end).filter(x => x.type === t);
+
+  function mk(type, ...parts) {
+    let len = 8;
+    for (const p of parts) len += p.length;
+    const out = new Uint8Array(len);
+    const dv = new DataView(out.buffer);
+    dv.setUint32(0, len);
+    out[4] = type.charCodeAt(0); out[5] = type.charCodeAt(1); out[6] = type.charCodeAt(2); out[7] = type.charCodeAt(3);
+    let o = 8;
+    for (const p of parts) { out.set(p, o); o += p.length; }
+    return out;
+  }
+  function u32s(...vals) {
+    const out = new Uint8Array(vals.length * 4);
+    const dv = new DataView(out.buffer);
+    vals.forEach((v, i) => dv.setUint32(i * 4, v >>> 0));
+    return out;
+  }
+  const rawBox = (u8, b) => u8.slice(b.start, b.end);
+
+  // Remonta um MP4 fragmentado (fMP4) em MP4 comum, com duração e tabelas completas
+  function fixMp4(u8) {
+    const top = boxes(u8, 0, u8.length);
+    const ftyp = top.find(b => b.type === 'ftyp');
+    const moov = top.find(b => b.type === 'moov');
+    if (!moov) return null;
+    const moofs = top.filter(b => b.type === 'moof');
+    if (!moofs.length) return null; // já é um MP4 comum
+
+    // trex (padrões) e trilhas
+    const trex = {};
+    const mvex = find(u8, moov, 'mvex');
+    if (mvex) for (const t of findAll(u8, mvex, 'trex')) {
+      const d = new DataView(u8.buffer, u8.byteOffset + t.body);
+      trex[d.getUint32(4)] = { dur: d.getUint32(12), size: d.getUint32(16), flags: d.getUint32(20) };
+    }
+    const traks = findAll(u8, moov, 'trak').map(tk => {
+      const tkhd = find(u8, tk, 'tkhd');
+      const d = new DataView(u8.buffer, u8.byteOffset + tkhd.body);
+      const id = d.getUint8(0) === 1 ? d.getUint32(20) : d.getUint32(12);
+      const mdia = find(u8, tk, 'mdia');
+      const mdhd = find(u8, mdia, 'mdhd');
+      const md = new DataView(u8.buffer, u8.byteOffset + mdhd.body);
+      const ts = md.getUint8(0) === 1 ? md.getUint32(20) : md.getUint32(12);
+      return { box: tk, id, tkhd, mdia, mdhd, ts, samples: [], chunks: [], start: null };
+    });
+    const byId = {}; traks.forEach(t => byId[t.id] = t);
+
+    // Lê os fragmentos
+    for (const mf of moofs) {
+      for (const traf of findAll(u8, mf, 'traf')) {
+        const tfhd = find(u8, traf, 'tfhd');
+        const d = new DataView(u8.buffer, u8.byteOffset + tfhd.body);
+        const flags = d.getUint32(0) & 0xffffff;
+        const tid = d.getUint32(4);
+        const tr = byId[tid]; if (!tr) continue;
+        let o = 8, baseOff = mf.start;
+        if (flags & 0x1) { baseOff = Number(d.getBigUint64(o)); o += 8; }
+        if (flags & 0x2) o += 4;
+        const tx = trex[tid] || { dur: 0, size: 0, flags: 0 };
+        let defDur = tx.dur, defSize = tx.size, defFlags = tx.flags;
+        if (flags & 0x8) { defDur = d.getUint32(o); o += 4; }
+        if (flags & 0x10) { defSize = d.getUint32(o); o += 4; }
+        if (flags & 0x20) { defFlags = d.getUint32(o); o += 4; }
+        const tfdt = find(u8, traf, 'tfdt');
+        if (tfdt && tr.start === null) {
+          const t = new DataView(u8.buffer, u8.byteOffset + tfdt.body);
+          tr.start = t.getUint8(0) === 1 ? Number(t.getBigUint64(4)) : t.getUint32(4);
+        }
+        let cursor = null;
+        for (const trun of findAll(u8, traf, 'trun')) {
+          const r = new DataView(u8.buffer, u8.byteOffset + trun.body);
+          const ver = r.getUint8(0), fl = r.getUint32(0) & 0xffffff;
+          const n = r.getUint32(4);
+          let p = 8, dataOff = null;
+          if (fl & 0x1) { dataOff = r.getInt32(p); p += 4; }
+          let firstFlags = null;
+          if (fl & 0x4) { firstFlags = r.getUint32(p); p += 4; }
+          let pos = dataOff !== null ? baseOff + dataOff : (cursor !== null ? cursor : baseOff);
+          const chunk = { off: pos, count: n, bytes: 0 };
+          for (let i = 0; i < n; i++) {
+            const dur = (fl & 0x100) ? r.getUint32(p) : defDur; if (fl & 0x100) p += 4;
+            const size = (fl & 0x200) ? r.getUint32(p) : defSize; if (fl & 0x200) p += 4;
+            let sf = (fl & 0x400) ? r.getUint32(p) : (i === 0 && firstFlags !== null ? firstFlags : defFlags); if (fl & 0x400) p += 4;
+            if (i === 0 && firstFlags !== null && (fl & 0x400)) sf = r.getUint32(p - 4);
+            let cts = 0;
+            if (fl & 0x800) { cts = ver === 0 ? r.getUint32(p) : r.getInt32(p); p += 4; }
+            tr.samples.push({ dur, size, sync: !(sf & 0x10000), cts });
+            chunk.bytes += size;
+          }
+          cursor = pos + chunk.bytes;
+          tr.chunks.push(chunk);
+        }
+      }
+    }
+    if (!traks.some(t => t.samples.length)) return null;
+
+    // Ordem de escrita do mdat: a mesma ordem dos fragmentos
+    const order = [];
+    for (const tr of traks) for (const c of tr.chunks) order.push({ tr, c });
+    order.sort((a, b) => a.c.off - b.c.off);
+    let mdatSize = 0;
+    for (const x of order) { x.rel = mdatSize; mdatSize += x.c.bytes; }
+
+    const mvhd = find(u8, moov, 'mvhd');
+    const mvd = new DataView(u8.buffer, u8.byteOffset + mvhd.body);
+    const mv1 = mvd.getUint8(0) === 1;
+    const mvTs = mv1 ? mvd.getUint32(20) : mvd.getUint32(12);
+
+    const patchDur = (raw, bodyOff, ver1, tsOff, durOff, value) => {
+      const c = raw.slice();
+      const dv = new DataView(c.buffer);
+      if (ver1) { dv.setBigUint64(bodyOff + durOff, BigInt(value)); }
+      else dv.setUint32(bodyOff + durOff, value >>> 0);
+      return c;
+    };
+
+    let movieDur = 0;
+    const trakInfo = traks.map(tr => {
+      let total = 0; for (const s of tr.samples) total += s.dur;
+      const startOff = tr.start || 0;
+      const durMovie = Math.round((total + startOff) * mvTs / tr.ts);
+      movieDur = Math.max(movieDur, durMovie);
+      return { tr, total, startOff, durMovie };
+    });
+
+    function buildTrak(info, chunkBase) {
+      const { tr, total, startOff, durMovie } = info;
+      const S = tr.samples;
+      // stts
+      const stts = []; for (const s of S) { const l = stts[stts.length - 1]; if (l && l[1] === s.dur) l[0]++; else stts.push([1, s.dur]); }
+      const sttsB = mk('stts', u32s(0, stts.length), ...stts.map(e => u32s(e[0], e[1])));
+      // ctts
+      let cttsB = new Uint8Array(0);
+      if (S.some(s => s.cts !== 0)) {
+        const neg = S.some(s => s.cts < 0);
+        const c = []; for (const s of S) { const l = c[c.length - 1]; if (l && l[1] === s.cts) l[0]++; else c.push([1, s.cts]); }
+        cttsB = mk('ctts', u32s(neg ? 0x01000000 : 0, c.length), ...c.map(e => u32s(e[0], e[1])));
+      }
+      // stss
+      let stssB = new Uint8Array(0);
+      if (S.some(s => !s.sync)) {
+        const idx = []; S.forEach((s, i) => { if (s.sync) idx.push(i + 1); });
+        stssB = mk('stss', u32s(0, idx.length), u32s(...idx));
+      }
+      // stsc + stco
+      const stscE = []; let n = 1;
+      tr.chunks.forEach((c, i) => { const l = stscE[stscE.length - 1]; if (!l || l[1] !== c.count) stscE.push([i + 1, c.count, 1]); });
+      const stscB = mk('stsc', u32s(0, stscE.length), ...stscE.map(e => u32s(e[0], e[1], e[2])));
+      const stszB = mk('stsz', u32s(0, 0, S.length), u32s(...S.map(s => s.size)));
+      const offs = chunkBase(tr);
+      const stcoB = mk('stco', u32s(0, offs.length), u32s(...offs));
+      const stsd = find(u8, find(u8, find(u8, tr.mdia, 'minf'), 'stbl'), 'stsd');
+      const stbl = mk('stbl', rawBox(u8, stsd), sttsB, cttsB, stssB, stscB, stszB, stcoB);
+      const minf = find(u8, tr.mdia, 'minf');
+      const minfParts = boxes(u8, minf.body, minf.end).map(b => b.type === 'stbl' ? stbl : rawBox(u8, b));
+      const minfB = mk('minf', ...minfParts);
+      const mdhdRaw = rawBox(u8, tr.mdhd);
+      const mdhdB = patchDur(mdhdRaw, 8, mdhdRaw[8] === 1, 0, mdhdRaw[8] === 1 ? 24 : 16, total);
+      const mdiaParts = boxes(u8, tr.mdia.body, tr.mdia.end).map(b => b.type === 'mdhd' ? mdhdB : b.type === 'minf' ? minfB : rawBox(u8, b));
+      const mdiaB = mk('mdia', ...mdiaParts);
+      const tkhdRaw = rawBox(u8, tr.tkhd);
+      const tkhdB = patchDur(tkhdRaw, 8, tkhdRaw[8] === 1, 0, tkhdRaw[8] === 1 ? 28 : 20, durMovie);
+      let edts = new Uint8Array(0);
+      if (startOff > 0) {
+        const emptyDur = Math.round(startOff * mvTs / tr.ts);
+        edts = mk('edts', mk('elst', u32s(0, 2, emptyDur, 0xffffffff, 0x00010000, Math.max(0, durMovie - emptyDur), 0, 0x00010000)));
+      }
+      return mk('trak', tkhdB, edts, mdiaB);
+    }
+
+    const ftypB = ftyp ? rawBox(u8, ftyp) : new Uint8Array(0);
+    const mvhdRaw = rawBox(u8, mvhd);
+    const mvhdB = patchDur(mvhdRaw, 8, mvhdRaw[8] === 1, 0, mvhdRaw[8] === 1 ? 24 : 16, movieDur);
+
+    // 1ª passagem: tamanho do moov com offsets provisórios
+    const build = (base) => {
+      const trakBs = trakInfo.map(info => buildTrak(info, tr => {
+        const list = [];
+        for (const x of order) if (x.tr === tr) list.push(base + x.rel);
+        return list;
+      }));
+      return mk('moov', mvhdB, ...trakBs);
+    };
+    const moovTmp = build(0);
+    const mdatStart = ftypB.length + moovTmp.length + 8;
+    const moovB = build(mdatStart);
+
+    const out = new Uint8Array(ftypB.length + moovB.length + 8 + mdatSize);
+    let o = 0;
+    out.set(ftypB, o); o += ftypB.length;
+    out.set(moovB, o); o += moovB.length;
+    new DataView(out.buffer).setUint32(o, 8 + mdatSize);
+    out.set([0x6d, 0x64, 0x61, 0x74], o + 4); o += 8;
+    for (const x of order) { out.set(u8.subarray(x.c.off, x.c.off + x.c.bytes), o); o += x.c.bytes; }
+    return { data: out, durationSec: movieDur / mvTs };
+  }
+
+  // ---------- WebM: grava a duração no cabeçalho ----------
+  function readVint(u8, p, keepMarker) {
+    const b = u8[p]; let len = 1, mask = 0x80;
+    while (len <= 8 && !(b & mask)) { len++; mask >>= 1; }
+    if (len > 8) return null;
+    let v = keepMarker ? b : (b & (mask - 1));
+    let unknown = (b & (mask - 1)) === mask - 1;
+    for (let i = 1; i < len; i++) { v = v * 256 + u8[p + i]; if (u8[p + i] !== 0xff) unknown = false; }
+    return { len, v, unknown };
+  }
+  function encSize(n) {
+    let len = 1; while (n >= Math.pow(2, 7 * len) - 1 && len < 8) len++;
+    const out = new Uint8Array(len);
+    let v = n;
+    for (let i = len - 1; i >= 0; i--) { out[i] = v % 256; v = Math.floor(v / 256); }
+    out[0] |= (0x80 >> (len - 1));
+    return out;
+  }
+  function fixWebm(u8, durationMs) {
+    // procura Info (0x1549A966) dentro do Segment, nos primeiros 4 KB
+    const lim = Math.min(u8.length - 8, 4096);
+    let infoPos = -1;
+    for (let i = 0; i < lim; i++) {
+      if (u8[i] === 0x15 && u8[i + 1] === 0x49 && u8[i + 2] === 0xA9 && u8[i + 3] === 0x66) { infoPos = i; break; }
+    }
+    if (infoPos < 0) return null;
+    const sz = readVint(u8, infoPos + 4, false);
+    if (!sz || sz.unknown) return null;
+    const bodyStart = infoPos + 4 + sz.len, bodyEnd = bodyStart + sz.v;
+    // já tem Duration (0x4489)? então não mexe
+    let scale = 1000000, p = bodyStart;
+    while (p < bodyEnd) {
+      const id = readVint(u8, p, true); if (!id) return null;
+      const s = readVint(u8, p + id.len, false); if (!s) return null;
+      if (id.v === 0x4489) return null;
+      if (id.v === 0x2AD7B1) { scale = 0; for (let i = 0; i < s.v; i++) scale = scale * 256 + u8[p + id.len + s.len + i]; }
+      p += id.len + s.len + s.v;
+    }
+    const dur = new Uint8Array(11);
+    dur.set([0x44, 0x89, 0x88]);
+    new DataView(dur.buffer).setFloat64(3, durationMs / (scale / 1e6));
+    const newSize = encSize(sz.v + dur.length);
+    const out = new Uint8Array(u8.length + dur.length + (newSize.length - sz.len));
+    let o = 0;
+    out.set(u8.subarray(0, infoPos + 4), o); o += infoPos + 4;
+    out.set(newSize, o); o += newSize.length;
+    out.set(u8.subarray(bodyStart, bodyEnd), o); o += sz.v;
+    out.set(dur, o); o += dur.length;
+    out.set(u8.subarray(bodyEnd), o);
+    return out;
+  }
+
+  async function fixBlob(blob, mime, wallMs) {
+    try {
+      const u8 = new Uint8Array(await blob.arrayBuffer());
+      if (mime.includes('mp4')) {
+        const r = fixMp4(u8);
+        if (r) return { blob: new Blob([r.data], { type: 'video/mp4' }), sec: r.durationSec };
+      } else if (mime.includes('webm')) {
+        const r = fixWebm(u8, wallMs);
+        if (r) return { blob: new Blob([r], { type: mime }), sec: wallMs / 1000 };
+      }
+    } catch (e) { console.warn('Falha ao corrigir duração', e); }
+    return { blob, sec: wallMs / 1000 };
+  }
+  return { fixMp4, fixWebm, fixBlob };
+})();
+  </script>
   <style>
     body {
       font-family: 'Inter', system-ui, -apple-system, sans-serif;
@@ -392,20 +682,25 @@
           }
         };
 
-        rec.onstop = () => {
+        rec.onstop = async () => {
           if (!slot.captureRequested) {
             slot.chunks = [];
             return;
           }
-          const durationSec = Math.max(1, Math.round((Date.now() - slot.startedAt) / 1000));
+          const wallMs = Date.now() - slot.startedAt;
           const mime = rec.mimeType || selectedMimeType || 'video/webm';
-          const blob = new Blob(slot.chunks, { type: mime });
+          const rawBlob = new Blob(slot.chunks, { type: mime });
           slot.chunks = [];
 
-          if (blob.size === 0) {
+          if (rawBlob.size === 0) {
             showToast('O clipe ficou vazio. Aguarde 1 segundo antes de capturar.', 'warning');
             return;
           }
+
+          // Grava a duração real no arquivo (senão a galeria mostra 1s)
+          const fixed = await FixMedia.fixBlob(rawBlob, mime, wallMs);
+          const blob = fixed.blob;
+          const durationSec = Math.max(1, Math.round(fixed.sec));
 
           const url = URL.createObjectURL(blob);
           const ext = mime.includes('mp4') ? 'mp4' : 'webm';
